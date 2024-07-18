@@ -1,0 +1,1526 @@
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\JwtOptions.cs
+namespace MyWebAPP;
+
+public class JwtOptions
+
+{
+    public string issuer { get; set; }
+    public string audience { get; set; }
+    public int lifetime { get; set; }
+    public string signingKey { get; set; }
+}
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Program.cs
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using System.Text;
+using Serilog;
+using Microsoft.OpenApi.Models;
+using MyWebAPP.Authorization;
+using MyWebAPP.Models;
+
+namespace MyWebAPP
+{
+    public class Program
+    {
+        public static void Main(string[] args)
+        {
+            var builder = WebApplication.CreateBuilder(args);
+
+            // Add services to the container.
+            builder.Services.AddControllers(options =>
+            {
+                options.Filters.Add<PermissionBasedAuthorizationFilter>();
+            });
+
+            // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
+            builder.Services.AddEndpointsApiExplorer();
+            builder.Services.AddSwaggerGen(c =>
+            {
+                c.SwaggerDoc("v1", new OpenApiInfo { Title = "Day1 API", Version = "v1" });
+
+                // Configure JWT authentication for Swagger
+                c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+                {
+                    Name = "Authorization",
+                    Type = SecuritySchemeType.ApiKey,
+                    Scheme = "Bearer",
+                    BearerFormat = "JWT",
+                    In = ParameterLocation.Header,
+                    Description = "Enter 'Bearer' [space] and then your token in the text input below. Example: 'Bearer 12345abcdef'"
+                });
+
+                c.AddSecurityRequirement(new OpenApiSecurityRequirement
+                {
+                    {
+                        new OpenApiSecurityScheme
+                        {
+                            Reference = new OpenApiReference
+                            {
+                                Type = ReferenceType.SecurityScheme,
+                                Id = "Bearer"
+                            }
+                        },
+                        Array.Empty<string>()
+                    }
+                });
+            });
+
+
+            // Configure database connection
+            builder.Services.AddDbContext<LibraryContext>(options =>
+            {
+                options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"));
+            });
+
+            //authentication
+            var jwtOptions = builder.Configuration.GetSection("JwtOptions").Get<JwtOptions>();
+            builder.Services.AddSingleton(jwtOptions);
+            builder.Services.AddAuthentication().AddJwtBearer(JwtBearerDefaults.AuthenticationScheme, options =>
+            {
+                options.SaveToken = true;
+                options.TokenValidationParameters = new TokenValidationParameters
+                {
+                    ValidateIssuer = true,
+                    ValidateAudience = true,
+                    ValidateLifetime = true,
+                    ValidateIssuerSigningKey = true,
+                    IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtOptions.signingKey)),
+                    ValidIssuer = jwtOptions.issuer,
+                    ValidAudience = jwtOptions.audience,
+                };
+            });
+
+
+            var app = builder.Build();
+
+            // Configure the HTTP request pipeline.
+            if (app.Environment.IsDevelopment())
+            {
+                app.UseSwagger();
+                app.UseSwaggerUI();
+            }
+
+            app.UseHttpsRedirection();
+
+            app.UseAuthentication();
+            app.UseAuthorization();
+
+            app.MapControllers();
+
+            app.Run();
+        }
+    }
+}
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Authorization\CheckPermissionAttribute.cs
+using MyWebAPP.Models;
+
+namespace MyWebAPP.Authorization;
+
+[AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
+public class CheckPermissionAttribute : Attribute
+{
+    public Permission Permission { get; }
+
+    public CheckPermissionAttribute(Permission permission)
+    {
+        Permission = permission;
+    }
+}
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Authorization\PermissionBasedAuthorizationFilter.cs
+using MyWebAPP.Models;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Filters;
+using System.Security.Claims;
+
+namespace MyWebAPP.Authorization;
+
+public class PermissionBasedAuthorizationFilter(LibraryContext dbContext) : IAuthorizationFilter
+{
+    public void OnAuthorization(AuthorizationFilterContext context)
+    {
+        var attribute =
+            (CheckPermissionAttribute)context.ActionDescriptor.EndpointMetadata.FirstOrDefault(x =>
+                x is CheckPermissionAttribute);
+        if (attribute != null)
+        {
+            var claimIdentity = context.HttpContext.User.Identity as ClaimsIdentity;
+            if (claimIdentity == null || !claimIdentity.IsAuthenticated)
+            {
+                context.Result = new ForbidResult();
+            }
+            else
+            {
+                var userid = int.Parse(claimIdentity.FindFirst(ClaimTypes.NameIdentifier).Value);
+                var hasPermission = dbContext.Set<UserPermission>()
+                    .Any(x => x.UserID == userid && x.PermissionID == attribute.Permission);
+                if (!hasPermission)
+                {
+                    context.Result = new ForbidResult();
+                }
+            }
+        }
+    }
+}
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Controllers\AuthorsController.cs
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using MyWebAPP.Models;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
+using MyWebAPP.Authorization;
+
+namespace MyWebAPP.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    [Authorize]
+    public class AuthorsController : ControllerBase
+    {
+        private readonly LibraryContext _context;
+
+        public AuthorsController(LibraryContext context)
+        {
+            _context = context;
+        }
+
+        [HttpGet]
+        [CheckPermission(Permission.Read)]
+        public async Task<ActionResult<IEnumerable<Author>>> GetAuthors()
+        {
+            return await _context.Authors.ToListAsync();
+        }
+
+        [HttpGet("{id}")]
+        public async Task<ActionResult<Author>> GetAuthorById(int id)
+        {
+            var author = await _context.Authors.FindAsync(id);
+
+            if (author == null)
+            {
+                return NotFound();
+            }
+
+            return author;
+        }
+
+        [HttpPost]
+        public async Task<ActionResult<Author>> AddAuthor(Author author)
+        {
+            _context.Authors.Add(author);
+            await _context.SaveChangesAsync();
+
+            return CreatedAtAction(nameof(GetAuthorById), new { id = author.Id }, author);
+        }
+
+        [HttpPut("{id}")]
+        public async Task<IActionResult> UpdateAuthor(int id, Author author)
+        {
+            if (id != author.Id)
+            {
+                return BadRequest();
+            }
+
+            _context.Entry(author).State = EntityState.Modified;
+
+            try
+            {
+                await _context.SaveChangesAsync();
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                if (!AuthorExists(id))
+                {
+                    return NotFound();
+                }
+                else
+                {
+                    throw;
+                }
+            }
+
+            return NoContent();
+        }
+
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> DeleteAuthor(int id)
+        {
+            var author = await _context.Authors.FindAsync(id);
+            if (author == null)
+            {
+                return NotFound();
+            }
+
+            _context.Authors.Remove(author);
+            await _context.SaveChangesAsync();
+
+            return NoContent();
+        }
+
+        private bool AuthorExists(int id)
+        {
+            return _context.Authors.Any(e => e.Id == id);
+        }
+    }
+}
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Controllers\BooksController.cs
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using MyWebAPP.Models;
+using MyWebAPP.DTOs;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MyWebAPP.Authorization;
+
+namespace MyWebAPP.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    public class BooksController : ControllerBase
+    {
+        private readonly LibraryContext _context;
+
+        public BooksController(LibraryContext context)
+        {
+            _context = context;
+        }
+
+        [HttpGet]
+        [CheckPermission(Permission.Read)]
+        public async Task<ActionResult<IEnumerable<Book>>> GetBooks()
+        {
+            var books = await _context.Books
+                .Include(b => b.Author)
+                .Include(b => b.Category)
+                .ToListAsync();
+
+            return books;
+        }
+
+        [HttpGet("{isbn}")]
+        [CheckPermission(Permission.Read)]
+        public async Task<ActionResult<Book>> GetBookByISBN(string isbn)
+        {
+            var book = await _context.Books
+                .Include(b => b.Author)
+                .Include(b => b.Category)
+                .FirstOrDefaultAsync(b => b.ISBN == isbn);
+
+            if (book == null)
+            {
+                return NotFound();
+            }
+
+            return book;
+        }
+
+        [HttpPost]
+        [CheckPermission(Permission.Add)]
+        public async Task<ActionResult<Book>> AddBook(BookDTO bookDTO)
+        {
+            var author = await _context.Authors.FindAsync(bookDTO.AuthorId);
+            if (author == null)
+            {
+                return BadRequest("Invalid author ID.");
+            }
+
+            var category = await _context.Categories.FindAsync(bookDTO.CategoryId);
+            if (category == null)
+            {
+                return BadRequest("Invalid category ID.");
+            }
+
+            var book = new Book
+            {
+                Title = bookDTO.Title,
+                ISBN = bookDTO.ISBN,
+                AuthorId = bookDTO.AuthorId,
+                CategoryId = bookDTO.CategoryId,
+                Category = category,
+                Author = author
+                // You can add other properties here as needed
+            };
+
+            _context.Books.Add(book);
+            await _context.SaveChangesAsync();
+
+            return CreatedAtAction(nameof(GetBookByISBN), new { isbn = book.ISBN }, book);
+        }
+
+        [HttpGet("author/id/{authorId}")]
+        [CheckPermission(Permission.Read)]
+        public async Task<ActionResult<IEnumerable<Book>>> GetBooksByAuthor(int authorId)
+        {
+            var books = await _context.Books
+                .Where(b => b.AuthorId == authorId)
+                .Include(b => b.Author)
+                .Include(b => b.Category)
+                .ToListAsync();
+
+            return books;
+        }
+
+        [HttpGet("author/name/{authorName}")]
+        [CheckPermission(Permission.Read)]
+        public async Task<ActionResult<IEnumerable<Book>>> GetBooksByAuthor(string authorName)
+        {
+            var books = await _context.Books
+                .Where(b => b.Author.Name == authorName)
+                .Include(b => b.Author)
+                .Include(b => b.Category)
+                .ToListAsync();
+
+            return books;
+        }
+
+        [HttpGet("category/id/{categoryId}")]
+        [CheckPermission(Permission.Read)]
+        public async Task<ActionResult<IEnumerable<Book>>> GetBooksByCategory(int categoryId)
+        {
+            var books = await _context.Books
+                .Where(b => b.CategoryId == categoryId)
+                .Include(b => b.Author)
+                .Include(b => b.Category)
+                .ToListAsync();
+
+            return books;
+        }
+
+        [HttpGet("category/name/{categoryName}")]
+        [CheckPermission(Permission.Read)]
+        public async Task<ActionResult<IEnumerable<Book>>> GetBooksByCategory(string categoryName)
+        {
+            var books = await _context.Books
+                .Where(b => b.Category.Name == categoryName)
+                .Include(b => b.Author)
+                .Include(b => b.Category)
+                .ToListAsync();
+
+            return books;
+        }
+
+        [HttpPut("{isbn}")]
+        [CheckPermission(Permission.Edit)]
+        public async Task<IActionResult> UpdateBook(string isbn, BookDTO bookDTO)
+        {
+            var book = await _context.Books.FirstOrDefaultAsync(b => b.ISBN == isbn);
+
+            if (book == null)
+            {
+                return NotFound();
+            }
+
+            var author = await _context.Authors.FindAsync(bookDTO.AuthorId);
+            if (author == null)
+            {
+                return BadRequest("Invalid author ID.");
+            }
+
+            var category = await _context.Categories.FindAsync(bookDTO.CategoryId);
+            if (category == null)
+            {
+                return BadRequest("Invalid category ID.");
+            }
+
+            book.Title = bookDTO.Title;
+            book.ISBN = bookDTO.ISBN;
+            book.AuthorId = bookDTO.AuthorId;
+            book.CategoryId = bookDTO.CategoryId;
+            book.Category = category;
+            book.Author = author;
+
+            await _context.SaveChangesAsync();
+
+            return NoContent();
+        }
+
+        [HttpDelete("{isbn}")]
+        [CheckPermission(Permission.Delete)]
+        public async Task<IActionResult> DeleteBook(string isbn)
+        {
+            var book = await _context.Books.FirstOrDefaultAsync(b => b.ISBN == isbn);
+            if (book == null)
+            {
+                return NotFound();
+            }
+
+            _context.Books.Remove(book);
+            await _context.SaveChangesAsync();
+
+            return NoContent();
+        }
+    }
+}
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Controllers\CategoriesController.cs
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using MyWebAPP.Models;
+using Microsoft.AspNetCore.Authorization;
+using MyWebAPP.Authorization;
+
+namespace MyWebAPP.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    [Authorize]
+    public class CategoriesController : ControllerBase
+    {
+        private readonly LibraryContext _context;
+
+        public CategoriesController(LibraryContext context)
+        {
+            _context = context;
+        }
+
+        [HttpPost]
+        [CheckPermission(Permission.Add)]
+        public async Task<ActionResult<Category>> AddCategory(Category category)
+        {
+            _context.Categories.Add(category);
+            await _context.SaveChangesAsync();
+
+            return CreatedAtAction(nameof(AddCategory), new { id = category.Id }, category);
+        }
+
+        [HttpDelete("{id}")]
+        [CheckPermission(Permission.Delete)]
+        public async Task<IActionResult> DeleteCategory(int id)
+        {
+            var category = await _context.Categories.FindAsync(id);
+            if (category == null)
+            {
+                return NotFound();
+            }
+
+            _context.Categories.Remove(category);
+            await _context.SaveChangesAsync();
+
+            return NoContent();
+        }
+
+        [HttpGet]
+        // [CheckPermission(Permission.Read)]
+        public async Task<ActionResult<IEnumerable<Category>>> GetAllCategories()
+        {
+            return await _context.Categories.ToListAsync();
+        }
+    }
+}
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Controllers\UserController.cs
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
+using System.IdentityModel.Tokens.Jwt;
+using Microsoft.IdentityModel.Tokens;
+using System.Text;
+using System.Security.Claims;
+using MyWebAPP.Models;
+using Serilog;
+using MyWebAPP.DTOs;
+
+namespace MyWebAPP.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class UserController : ControllerBase
+    {
+        private readonly JwtOptions _jwtOptions;
+        private readonly LibraryContext _dbContext;
+
+        public UserController(JwtOptions jwtOptions, LibraryContext dbContext)
+        {
+            _jwtOptions = jwtOptions;
+            _dbContext = dbContext;
+        }
+
+        [HttpPost("auth")]
+        public ActionResult<string> AuthenticateUser(AuthenticationRequest request)
+        {
+            var user = _dbContext.Set<User>().FirstOrDefault(x => x.Username == request.Username && x.Password == request.Password);
+            if (user == null)
+            {
+                Log.Warning("Authentication failed for user {Username}", request.Username);
+                return Unauthorized();
+            }
+
+            var tokenHandler = new JwtSecurityTokenHandler();
+            var tokenDescriptor = new SecurityTokenDescriptor
+            {
+                Issuer = _jwtOptions.issuer,
+                Audience = _jwtOptions.audience,
+                SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwtOptions.signingKey)), SecurityAlgorithms.HmacSha256Signature),
+                Subject = new ClaimsIdentity(new Claim[]
+                {
+                    new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
+                    new Claim(ClaimTypes.Name, user.Username)
+                }),
+            };
+            var securityToken = tokenHandler.CreateToken(tokenDescriptor);
+            var accessToken = tokenHandler.WriteToken(securityToken);
+
+            Log.Information("User {Username} authenticated successfully", user.Username);
+            return Ok(accessToken);
+        }
+    }
+}
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\DTOs\AuthenticateRequest.cs
+namespace MyWebAPP.DTOs;
+
+public class AuthenticationRequest
+{
+    public string Username { get; set; }
+    public string Password { get; set; }
+}
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\DTOs\BookDTO.cs
+namespace MyWebAPP.DTOs;
+
+public class BookDTO
+{
+    public string Title { get; set; }
+    public string ISBN { get; set; }
+    public int AuthorId { get; set; }
+    public int CategoryId { get; set; }
+}
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Migrations\20240716125337_Initial.cs
+using Microsoft.EntityFrameworkCore.Migrations;
+
+#nullable disable
+
+namespace MyWebAPP.Migrations
+{
+    /// <inheritdoc />
+    public partial class Initial : Migration
+    {
+        /// <inheritdoc />
+        protected override void Up(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.CreateTable(
+                name: "Authors",
+                columns: table => new
+                {
+                    Id = table.Column<int>(type: "int", nullable: false)
+                        .Annotation("SqlServer:Identity", "1, 1"),
+                    Name = table.Column<string>(type: "nvarchar(max)", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_Authors", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "Categories",
+                columns: table => new
+                {
+                    Id = table.Column<int>(type: "int", nullable: false)
+                        .Annotation("SqlServer:Identity", "1, 1"),
+                    Name = table.Column<string>(type: "nvarchar(max)", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_Categories", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "Books",
+                columns: table => new
+                {
+                    Id = table.Column<int>(type: "int", nullable: false)
+                        .Annotation("SqlServer:Identity", "1, 1"),
+                    Title = table.Column<string>(type: "nvarchar(max)", nullable: false),
+                    ISBN = table.Column<string>(type: "nvarchar(max)", nullable: false),
+                    AuthorId = table.Column<int>(type: "int", nullable: false),
+                    CategoryId = table.Column<int>(type: "int", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_Books", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_Books_Authors_AuthorId",
+                        column: x => x.AuthorId,
+                        principalTable: "Authors",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                    table.ForeignKey(
+                        name: "FK_Books_Categories_CategoryId",
+                        column: x => x.CategoryId,
+                        principalTable: "Categories",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_Books_AuthorId",
+                table: "Books",
+                column: "AuthorId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_Books_CategoryId",
+                table: "Books",
+                column: "CategoryId");
+        }
+
+        /// <inheritdoc />
+        protected override void Down(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.DropTable(
+                name: "Books");
+
+            migrationBuilder.DropTable(
+                name: "Authors");
+
+            migrationBuilder.DropTable(
+                name: "Categories");
+        }
+    }
+}
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Migrations\20240716125337_Initial.Designer.cs
+// <auto-generated />
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+using MyWebAPP.Models;
+
+#nullable disable
+
+namespace MyWebAPP.Migrations
+{
+    [DbContext(typeof(LibraryContext))]
+    [Migration("20240716125337_Initial")]
+    partial class Initial
+    {
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
+        {
+#pragma warning disable 612, 618
+            modelBuilder
+                .HasAnnotation("ProductVersion", "9.0.0-preview.6.24327.4")
+                .HasAnnotation("Relational:MaxIdentifierLength", 128);
+
+            SqlServerModelBuilderExtensions.UseIdentityColumns(modelBuilder);
+
+            modelBuilder.Entity("MyWebAPP.Models.Author", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Authors");
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.Book", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<int>("AuthorId")
+                        .HasColumnType("int");
+
+                    b.Property<int>("CategoryId")
+                        .HasColumnType("int");
+
+                    b.Property<string>("ISBN")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<string>("Title")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AuthorId");
+
+                    b.HasIndex("CategoryId");
+
+                    b.ToTable("Books");
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.Category", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Categories");
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.Book", b =>
+                {
+                    b.HasOne("MyWebAPP.Models.Author", "Author")
+                        .WithMany()
+                        .HasForeignKey("AuthorId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("MyWebAPP.Models.Category", "Category")
+                        .WithMany()
+                        .HasForeignKey("CategoryId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Author");
+
+                    b.Navigation("Category");
+                });
+#pragma warning restore 612, 618
+        }
+    }
+}
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Migrations\20240716142131_users.cs
+using Microsoft.EntityFrameworkCore.Migrations;
+
+#nullable disable
+
+namespace MyWebAPP.Migrations
+{
+    /// <inheritdoc />
+    public partial class users : Migration
+    {
+        /// <inheritdoc />
+        protected override void Up(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.CreateTable(
+                name: "UserPermissions",
+                columns: table => new
+                {
+                    UserID = table.Column<int>(type: "int", nullable: false),
+                    PermissionID = table.Column<int>(type: "int", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_UserPermissions", x => new { x.UserID, x.PermissionID });
+                });
+
+            migrationBuilder.CreateTable(
+                name: "Users",
+                columns: table => new
+                {
+                    Id = table.Column<int>(type: "int", nullable: false)
+                        .Annotation("SqlServer:Identity", "1, 1"),
+                    Username = table.Column<string>(type: "nvarchar(max)", nullable: false),
+                    Password = table.Column<string>(type: "nvarchar(max)", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_Users", x => x.Id);
+                });
+        }
+
+        /// <inheritdoc />
+        protected override void Down(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.DropTable(
+                name: "UserPermissions");
+
+            migrationBuilder.DropTable(
+                name: "Users");
+        }
+    }
+}
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Migrations\20240716142131_users.Designer.cs
+// <auto-generated />
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+using MyWebAPP.Models;
+
+#nullable disable
+
+namespace MyWebAPP.Migrations
+{
+    [DbContext(typeof(LibraryContext))]
+    [Migration("20240716142131_users")]
+    partial class users
+    {
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
+        {
+#pragma warning disable 612, 618
+            modelBuilder
+                .HasAnnotation("ProductVersion", "9.0.0-preview.6.24327.4")
+                .HasAnnotation("Relational:MaxIdentifierLength", 128);
+
+            SqlServerModelBuilderExtensions.UseIdentityColumns(modelBuilder);
+
+            modelBuilder.Entity("MyWebAPP.Models.Author", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Authors");
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.Book", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<int>("AuthorId")
+                        .HasColumnType("int");
+
+                    b.Property<int>("CategoryId")
+                        .HasColumnType("int");
+
+                    b.Property<string>("ISBN")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<string>("Title")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AuthorId");
+
+                    b.HasIndex("CategoryId");
+
+                    b.ToTable("Books");
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.Category", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Categories");
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.User", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Password")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<string>("Username")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Users", (string)null);
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.UserPermission", b =>
+                {
+                    b.Property<int>("UserID")
+                        .HasColumnType("int");
+
+                    b.Property<int>("PermissionID")
+                        .HasColumnType("int");
+
+                    b.HasKey("UserID", "PermissionID");
+
+                    b.ToTable("UserPermissions", (string)null);
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.Book", b =>
+                {
+                    b.HasOne("MyWebAPP.Models.Author", "Author")
+                        .WithMany()
+                        .HasForeignKey("AuthorId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("MyWebAPP.Models.Category", "Category")
+                        .WithMany()
+                        .HasForeignKey("CategoryId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Author");
+
+                    b.Navigation("Category");
+                });
+#pragma warning restore 612, 618
+        }
+    }
+}
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Migrations\20240716144956_roles.cs
+using Microsoft.EntityFrameworkCore.Migrations;
+
+#nullable disable
+
+namespace MyWebAPP.Migrations
+{
+    /// <inheritdoc />
+    public partial class roles : Migration
+    {
+        /// <inheritdoc />
+        protected override void Up(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.AddColumn<string>(
+                name: "Role",
+                table: "Users",
+                type: "nvarchar(max)",
+                nullable: false,
+                defaultValue: "");
+        }
+
+        /// <inheritdoc />
+        protected override void Down(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.DropColumn(
+                name: "Role",
+                table: "Users");
+        }
+    }
+}
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Migrations\20240716144956_roles.Designer.cs
+// <auto-generated />
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+using MyWebAPP.Models;
+
+#nullable disable
+
+namespace MyWebAPP.Migrations
+{
+    [DbContext(typeof(LibraryContext))]
+    [Migration("20240716144956_roles")]
+    partial class roles
+    {
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
+        {
+#pragma warning disable 612, 618
+            modelBuilder
+                .HasAnnotation("ProductVersion", "9.0.0-preview.6.24327.4")
+                .HasAnnotation("Relational:MaxIdentifierLength", 128);
+
+            SqlServerModelBuilderExtensions.UseIdentityColumns(modelBuilder);
+
+            modelBuilder.Entity("MyWebAPP.Models.Author", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Authors");
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.Book", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<int>("AuthorId")
+                        .HasColumnType("int");
+
+                    b.Property<int>("CategoryId")
+                        .HasColumnType("int");
+
+                    b.Property<string>("ISBN")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<string>("Title")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AuthorId");
+
+                    b.HasIndex("CategoryId");
+
+                    b.ToTable("Books");
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.Category", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Categories");
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.User", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Password")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<string>("Role")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<string>("Username")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Users", (string)null);
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.UserPermission", b =>
+                {
+                    b.Property<int>("UserID")
+                        .HasColumnType("int");
+
+                    b.Property<int>("PermissionID")
+                        .HasColumnType("int");
+
+                    b.HasKey("UserID", "PermissionID");
+
+                    b.ToTable("UserPermissions", (string)null);
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.Book", b =>
+                {
+                    b.HasOne("MyWebAPP.Models.Author", "Author")
+                        .WithMany()
+                        .HasForeignKey("AuthorId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("MyWebAPP.Models.Category", "Category")
+                        .WithMany()
+                        .HasForeignKey("CategoryId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Author");
+
+                    b.Navigation("Category");
+                });
+#pragma warning restore 612, 618
+        }
+    }
+}
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Migrations\LibraryContextModelSnapshot.cs
+// <auto-generated />
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+using MyWebAPP.Models;
+
+#nullable disable
+
+namespace MyWebAPP.Migrations
+{
+    [DbContext(typeof(LibraryContext))]
+    partial class LibraryContextModelSnapshot : ModelSnapshot
+    {
+        protected override void BuildModel(ModelBuilder modelBuilder)
+        {
+#pragma warning disable 612, 618
+            modelBuilder
+                .HasAnnotation("ProductVersion", "9.0.0-preview.6.24327.4")
+                .HasAnnotation("Relational:MaxIdentifierLength", 128);
+
+            SqlServerModelBuilderExtensions.UseIdentityColumns(modelBuilder);
+
+            modelBuilder.Entity("MyWebAPP.Models.Author", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Authors");
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.Book", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<int>("AuthorId")
+                        .HasColumnType("int");
+
+                    b.Property<int>("CategoryId")
+                        .HasColumnType("int");
+
+                    b.Property<string>("ISBN")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<string>("Title")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AuthorId");
+
+                    b.HasIndex("CategoryId");
+
+                    b.ToTable("Books");
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.Category", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Categories");
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.User", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Password")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<string>("Role")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<string>("Username")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Users", (string)null);
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.UserPermission", b =>
+                {
+                    b.Property<int>("UserID")
+                        .HasColumnType("int");
+
+                    b.Property<int>("PermissionID")
+                        .HasColumnType("int");
+
+                    b.HasKey("UserID", "PermissionID");
+
+                    b.ToTable("UserPermissions", (string)null);
+                });
+
+            modelBuilder.Entity("MyWebAPP.Models.Book", b =>
+                {
+                    b.HasOne("MyWebAPP.Models.Author", "Author")
+                        .WithMany()
+                        .HasForeignKey("AuthorId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("MyWebAPP.Models.Category", "Category")
+                        .WithMany()
+                        .HasForeignKey("CategoryId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Author");
+
+                    b.Navigation("Category");
+                });
+#pragma warning restore 612, 618
+        }
+    }
+}
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Models\Author.cs
+namespace MyWebAPP.Models;
+
+public class Author
+{
+    public int Id { get; set; }
+    public string Name { get; set; }
+    
+    
+}
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Models\Book.cs
+namespace MyWebAPP.Models;
+
+public class Book
+{
+    public int Id { get; set; }
+    public string Title { get; set; }
+    public string ISBN { get; set; }
+    public int AuthorId { get; set; }
+    public int CategoryId { get; set; }
+
+    public Author Author { get; set; }
+    public Category Category { get; set; }
+}
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Models\Category.cs
+namespace MyWebAPP.Models;
+
+public class Category
+{
+    public int Id { get; set; }
+    public string Name { get; set; }
+}
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Models\LibraryContext.cs
+using Microsoft.EntityFrameworkCore;
+
+namespace MyWebAPP.Models;
+
+public class LibraryContext : DbContext
+{
+    public DbSet<Book> Books { get; set; }
+    public DbSet<Author> Authors { get; set; }
+    public DbSet<Category> Categories { get; set; }
+
+    public LibraryContext(DbContextOptions<LibraryContext> options) : base(options)
+    {
+    }
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        // Configure relationships, constraints, etc.
+        modelBuilder.Entity<Book>()
+            .HasOne(b => b.Author)
+            .WithMany()
+            .HasForeignKey(b => b.AuthorId);
+
+        modelBuilder.Entity<Book>()
+            .HasOne(b => b.Category)
+            .WithMany()
+            .HasForeignKey(b => b.CategoryId);
+
+        // Add other configurations as needed
+        modelBuilder.Entity<User>().ToTable("Users");
+        modelBuilder.Entity<UserPermission>().ToTable("UserPermissions").HasKey(x=> new {x.UserID, x.PermissionID});
+
+        base.OnModelCreating(modelBuilder);
+    }
+}
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Models\Permission.cs
+namespace MyWebAPP.Models;
+
+public enum Permission
+{
+    Read = 1,
+    Add = 2,
+    Edit = 3,
+    Delete = 4
+}
+
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Models\User.cs
+namespace MyWebAPP.Models;
+
+public class User
+{
+    public int Id { get; set; }
+    public string Username { get; set; }
+    public string Password { get; set; }
+    public string Role { get; set; }
+}
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\Models\UserPermission.cs
+namespace MyWebAPP.Models;
+
+    public class UserPermission
+    {
+        public int UserID { get; set; }
+        public Permission PermissionID { get; set; }
+    }
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\obj\Debug\net8.0\.NETCoreApp,Version=v8.0.AssemblyAttributes.cs
+// <autogenerated />
+using System;
+using System.Reflection;
+[assembly: global::System.Runtime.Versioning.TargetFrameworkAttribute(".NETCoreApp,Version=v8.0", FrameworkDisplayName = ".NET 8.0")]
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\obj\Debug\net8.0\MyWebAPP.AssemblyInfo.cs
+//------------------------------------------------------------------------------
+// <auto-generated>
+//     This code was generated by a tool.
+//     Runtime Version:4.0.30319.42000
+//
+//     Changes to this file may cause incorrect behavior and will be lost if
+//     the code is regenerated.
+// </auto-generated>
+//------------------------------------------------------------------------------
+
+using System;
+using System.Reflection;
+
+[assembly: System.Reflection.AssemblyCompanyAttribute("MyWebAPP")]
+[assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
+[assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyProductAttribute("MyWebAPP")]
+[assembly: System.Reflection.AssemblyTitleAttribute("MyWebAPP")]
+[assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
+
+// Generated by the MSBuild WriteCodeFragment class.
+
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\obj\Debug\net8.0\MyWebAPP.GlobalUsings.g.cs
+// <auto-generated/>
+global using global::Microsoft.AspNetCore.Builder;
+global using global::Microsoft.AspNetCore.Hosting;
+global using global::Microsoft.AspNetCore.Http;
+global using global::Microsoft.AspNetCore.Routing;
+global using global::Microsoft.Extensions.Configuration;
+global using global::Microsoft.Extensions.DependencyInjection;
+global using global::Microsoft.Extensions.Hosting;
+global using global::Microsoft.Extensions.Logging;
+global using global::System;
+global using global::System.Collections.Generic;
+global using global::System.IO;
+global using global::System.Linq;
+global using global::System.Net.Http;
+global using global::System.Net.Http.Json;
+global using global::System.Threading;
+global using global::System.Threading.Tasks;
+
+
+// File: C:\Users\Administrator\source\repos\MyWebAPP\MyWebAPP\obj\Debug\net8.0\MyWebAPP.MvcApplicationPartsAssemblyInfo.cs
+//------------------------------------------------------------------------------
+// <auto-generated>
+//     This code was generated by a tool.
+//
+//     Changes to this file may cause incorrect behavior and will be lost if
+//     the code is regenerated.
+// </auto-generated>
+//------------------------------------------------------------------------------
+
+using System;
+using System.Reflection;
+
+[assembly: Microsoft.AspNetCore.Mvc.ApplicationParts.ApplicationPartAttribute("Swashbuckle.AspNetCore.SwaggerGen")]
+
+// Generated by the MSBuild WriteCodeFragment class.
+
+
+
